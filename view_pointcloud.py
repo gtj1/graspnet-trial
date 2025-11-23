@@ -1,3 +1,8 @@
+import os
+
+os.environ["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6"
+os.environ["LIBGL_DRIVERS_PATH"] = "/usr/lib/x86_64-linux-gnu/dri"
+
 import numpy as np
 import pyrealsense2 as rs
 import open3d as o3d
@@ -51,7 +56,7 @@ def main():
 
             # 去除无效点（深度为0通常会生成零点）
             valid = np.logical_and(np.isfinite(vtx).all(axis=1), (vtx != 0).any(axis=1))
-            vtx = vtx[valid]
+            vtx = vtx[valid] * [-1, 1, -1]
             colors = colors[valid]
 
             # 更新 Open3D 点云并渲染
@@ -82,3 +87,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
