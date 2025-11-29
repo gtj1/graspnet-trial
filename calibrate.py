@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import cv2
@@ -5,9 +6,39 @@ import roslibpy
 import numpy as np
 import pyrealsense2 as rs
 
-from typing import Any, cast
+from typing import Any, Callable, Iterable, Sequence, TypedDict
 from pyquaternion import Quaternion
 from itertools import product
+import pickle
+
+# roslaunch rosbridge_server rosbridge_websocket.launch
+
+class Position(TypedDict):
+    x: float
+    y: float
+    z: float
+    
+class Orientation(TypedDict):
+    w: float
+    x: float
+    y: float
+    z: float
+
+class Pose(TypedDict):
+    position: Position
+    orientation: Orientation
+
+Vector3 = Position
+
+type PositionGenerator = Iterable[Position]
+type PoseGenerator = Iterable[Pose]
+
+type MatLike = cv2.typing.MatLike
+type Image = MatLike
+
+
+def identity[T](x: T) -> T:
+    return x
 
 class AuboClient:
     client: roslibpy.Ros
@@ -20,11 +51,11 @@ class AuboClient:
         
         # wait for connection
         waited = 0.0
-        while not self.client.is_connected and waited < timeout:
+        while not self.client.is_connected and waited < timeout: # type: ignore
             time.sleep(0.1)
             waited += 0.1
 
-        if not self.client.is_connected:
+        if not self.client.is_connected:  # type: ignore
             print('Failed to connect to Aubo within {}s'.format(timeout))
             sys.exit(1)
             
@@ -40,7 +71,7 @@ class AuboClient:
         print('\nExiting.')
         sys.exit(0)
         
-    def set_pose(self, position: tuple[float, float, float], orientation: tuple[float, float, float, float]):
+    def set_pose(self, pose: Pose) -> None:
         # construct a PoseStamped message and publish it once
         t = time.time()
         secs = int(t)
@@ -51,27 +82,16 @@ class AuboClient:
                 'stamp': {'secs': secs, 'nsecs': nsecs},
                 'frame_id': 'world'
             },
-            'pose': {
-                'position': {
-                    'x': position[0],
-                    'y': position[1],
-                    'z': position[2]
-                },
-                'orientation': {
-                    'w': orientation[0],
-                    'x': orientation[1],
-                    'y': orientation[2],
-                    'z': orientation[3]
-                }
-            }
+            'pose': pose
         }
-        self.publisher.publish(roslibpy.Message(message))
+        self.publisher.publish(roslibpy.Message(message)) # type: ignore
 
 class Camera:
     profile: rs.pipeline_profile
     pipeline: rs.pipeline
+    preprocess: Callable[[Image], Image]
     
-    def __init__(self, width: int = 640, height: int = 480, fps: int = 30, warmup: int = 30):
+    def __init__(self, width: int = 640, height: int = 480, fps: int = 30, warmup: int = 30, preprocess: Callable[[Image], Image] = identity):
         pipeline = rs.pipeline()
         self.pipeline = pipeline
         cfg = rs.config()
@@ -87,6 +107,7 @@ class Camera:
         except:
             pipeline.stop()
             sys.exit(1)
+        self.preprocess = preprocess
         
     def capture(self):
         frames = self.pipeline.wait_for_frames(timeout_ms=5000)
@@ -94,123 +115,189 @@ class Camera:
         if not color:
             raise RuntimeError("无法获取彩色帧")
         img = np.asanyarray(color.get_data())
-        img = cv2.flip(img, -1)
+        img = self.preprocess(img)
         return img
     
     def shutdown(self):
         self.pipeline.stop()
 
-x0 = 0.5
-y0 = 0.0
-z0 = 0.5
-
-aubo = AuboClient(ip='127.0.0.1', port=9090, topic='/realtime_pose_goal')
-camera = Camera()
-
-def capture_at_pose(
-    dx: float,
-    dy: float,
-    dz: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    position = np.array([x0, y0, z0]) + np.array([dx, dy, dz])
-    orientation = (Quaternion(1, -dy / dz, dx / dz, 0) ** 0.7 * Quaternion(0, 0, 1, 0)).normalised.elements # type: ignore
-    aubo.set_pose(position.tolist(), orientation.tolist())
-    print('Published pose to Aubo.')
-    time.sleep(3)
-
-    img = camera.capture()
+def look_at(origin: Position, target: Position, up: Vector3, body: Orientation) -> Orientation:
+    forward = np.array([target['x'] - origin['x'],
+                        target['y'] - origin['y'],
+                        target['z'] - origin['z']])
+    forward = forward / np.linalg.norm(forward)
     
-    cv2.imwrite(f'capture_dx{dx:+.2f}_dy{dy:+.2f}_dz{dz:+.2f}.png', img)
+    up_vec = np.array([up['x'], up['y'], up['z']])
+    up_vec = up_vec / np.linalg.norm(up_vec)
     
-    return (
-        Quaternion(orientation[0], orientation[1], orientation[2], orientation[3]).rotation_matrix,
-        position,
-        img
-    )
+    right = np.cross(forward, up_vec)
+    right = right / np.linalg.norm(right)
+    
+    true_up = np.cross(right, forward)
+    
+    rot_matrix = np.array([
+        [right[0], true_up[0], -forward[0]],
+        [right[1], true_up[1], -forward[1]],
+        [right[2], true_up[2], -forward[2]]
+    ])
+    
+    quat = Quaternion(matrix=rot_matrix) * Quaternion(**body) # type: ignore
+    
+    return {
+        'w': float(quat.w), 'x': float(quat.x), 'y': float(quat.y), 'z': float(quat.z) # type: ignore
+    }
 
+
+class HandEyeSystem:
+    hand: AuboClient
+    eye: Camera
+    
+    def __init__(self, hand: AuboClient, eye: Camera):
+        self.hand = hand
+        self.eye = eye
         
-def main():
-    # mat, _, _ = capture_at_pose(-0.1, 0, 0.4)
-    # print(mat)
-    # return
+    def capture_at_pose(self, pose: Pose, wait: float) -> Image:
+        self.hand.set_pose(pose)
+        print('Published pose to Aubo.')
+        time.sleep(wait)
+        img = self.eye.capture()
+        return img
     
-    dx_list = (-0.1, 0.0, 0.1)
-    dy_list = (-0.2, -0.1, 0.0, 0.1, 0.2)
-    dz_list = (0.3, 0.35, 0.4, 0.45)
+class CharucoCalibrator:
+    board: cv2.aruco.CharucoBoard
+    detector: cv2.aruco.CharucoDetector
     
-    results: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-    for dx, dy, dz in product(dx_list, dy_list, dz_list):
-        results.append(capture_at_pose(dx, dy, dz))
-
-    # 检测棋盘格并进行相机内参与手眼标定
-    pattern_size = (7, 7)  # 内角点数量 (8x8 棋盘 -> 7x7 内角点)
-    square_size = 0.036  # 单位：米（与机器人位姿单位保持一致）
-    objp = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2) * square_size
-
-    objpoints = []     # 世界坐标中的棋盘角点
-    imgpoints = []     # 图像坐标中的角点
-    R_gripper2base_list = []  # 机器人末端相对于基座的旋转（从 results）
-    t_gripper2base_list = []  # 机器人末端相对于基座的平移（从 results）
-
-    term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-
-    for idx, (R_world_tool, pos_world, img) in enumerate(results):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        found, corners = cv2.findChessboardCorners(
-            gray, pattern_size,
-            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
-        if not found:
-            print(f"Chessboard not found in image {idx}, skipping.")
-            continue
-
-        corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), term)
-        objpoints.append(objp.copy())
-        imgpoints.append(corners)
+    def __init__(self, board: cv2.aruco.CharucoBoard):
+        self.board = board
+        self.detector = cv2.aruco.CharucoDetector(self.board)
         
-        # 在图像上绘制检测到的棋盘角点并保存
+    def detect(self, img: Image) -> tuple[MatLike, MatLike] | None:
+        charuco_corners, charuco_ids, marker_corners, marker_ids = self.detector.detectBoard(img)
+        if len(charuco_ids) < 4:
+            return None
+        del marker_corners, marker_ids
+        return charuco_corners, charuco_ids
+    
+    def draw_detected(self, img: Image, corners: MatLike, ids: MatLike) -> Image:
         vis = img.copy()
-        cv2.drawChessboardCorners(vis, pattern_size, corners, True)
-        save_name = f'capture_chess_idx{idx:02d}.png'
-        cv2.imwrite(save_name, vis)
-        print(f"Saved chessboard image: {save_name}")
-
-        # results 中的 R_world_tool 是工具（末端）在世界系下的旋转矩阵，pos_world 是末端在世界系下的位置
-        R_gripper2base_list.append(np.asarray(R_world_tool, dtype=np.float64))
-        t_gripper2base_list.append(np.asarray(pos_world, dtype=np.float64).reshape(3, 1))
-
-    if len(objpoints) < 3:
-        print("有效视图不足，至少需要 3 张成功检测棋盘格的图片进行标定。")
-        return
+        cv2.aruco.drawDetectedCornersCharuco(vis, corners, ids)
+        return vis
     
-    # 相机内参标定
-    image_size = (gray.shape[1], gray.shape[0])
-    ret, camera_matrix, dist_coefs, rvecs, tvecs = cv2.calibrateCamera(
-        objpoints, imgpoints, image_size, None, None)
-    print("相机内参矩阵:\n", camera_matrix)
-    print("畸变系数:\n", dist_coefs.ravel())
+    def calibrate_camera(self, corners_list: list[MatLike], ids_list: list[MatLike], image_size: tuple[int, int]) -> tuple[MatLike, MatLike, Sequence[MatLike], Sequence[MatLike]]:
+        if len(corners_list) < 3:
+            raise ValueError("At least 3 views are required for calibration.")
+        ret, camera_matrix, dist_coefs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
+            corners_list, ids_list, self.board,
+            image_size, np.array([]), np.array([]))
+        if not ret:
+            raise RuntimeError("Camera calibration failed.")
+        return camera_matrix, dist_coefs, rvecs, tvecs
+        
 
-    # 将每个视角的棋盘在相机坐标系下的旋转和平移（target2cam）
-    R_target2cam = []
-    t_target2cam = []
-    for rvec, tvec in zip(rvecs, tvecs):
-        Rmat, _ = cv2.Rodrigues(rvec)
-        R_target2cam.append(Rmat)
-        t_target2cam.append(tvec.reshape(3, 1))
-
-    # 手眼标定：求解相机到末端（tool）之间的变换
-    # 输入：R_gripper2base_list, t_gripper2base_list, R_target2cam, t_target2cam
-    # 输出：R_cam2gripper, t_cam2gripper （将相机坐标系变换到末端坐标系）
+def main():
+    aubo = AuboClient(ip='127.0.0.1', port=9090, topic='/realtime_pose_goal')
+    
+    width, height = 640, 480
+    camera = Camera(width=width, height=height, preprocess=lambda img: cv2.flip(img, -1))
+    system = HandEyeSystem(hand=aubo, eye=camera)
+    
+    calibrator = CharucoCalibrator(
+        board=cv2.aruco.CharucoBoard(
+            (8, 8), 0.05, 0.025, cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        )
+    )
+    
+    x_list = (0.4, 0.5, 0.6)
+    y_list = (-0.12, 0.0, 0.12)
+    z_list = (0.8, 0.87, 0.95)
+    
+    target = Position(x=0.45, y=0.0, z=0.5)
+    up = Vector3(x=1.0, y=0.0, z=0.0)
+    body = Orientation(w=0.0, x=-1/np.sqrt(2), y=1/np.sqrt(2), z=0.0)
+    
+    wait = 8.0  # seconds to wait after moving to a pose
+    
+    corner_results: list[tuple[Pose, tuple[MatLike, MatLike]]] = []
+    image_output_dir = 'temp_calib_captures'
+    
+    if not os.path.exists(image_output_dir):
+        os.makedirs(image_output_dir)
+        
+    points = list(product(x_list, y_list, z_list))
+    
+    for x, y, z in points:
+        position = Position(x=x, y=y, z=z)
+        orientation = look_at(
+            origin=position,
+            target=target,
+            up=up,
+            body=body
+        )
+        pose = Pose(position=position, orientation=orientation)
+        
+        image = system.capture_at_pose(pose, wait=wait)
+        print(image.shape)
+        cv2.imwrite(os.path.join(image_output_dir, f'raw_x{x:.4f}_y{y:.4f}_z{z:.4f}.png'), image)
+        
+        detection = calibrator.detect(image)
+        
+        if detection is None:
+            print(f"Charuco board not found at pose {pose}, skipping.")
+            continue
+        
+        corner_results.append((pose, detection))
+        corners, ids = detection
+        vis = calibrator.draw_detected(image, corners, ids)
+        
+        filename = os.path.join(image_output_dir, f'capture_x{x:.4f}_y{y:.4f}_z{z:.4f}.png')
+        cv2.imwrite(filename, vis)
+    
+    save_path = os.path.join('corner_results.pkl')
+    with open(save_path, 'wb') as f:
+        pickle.dump(corner_results, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    poses = [item[0] for item in corner_results]
+    corners_list = [item[1][0] for item in corner_results]
+    ids_list = [item[1][1] for item in corner_results]
+    
+    camera_matrix, dist_coefs, rvecs, tvecs = calibrator.calibrate_camera(
+        corners_list, ids_list, (width, height)
+    )
+        
+    R_target2cam_list = [cv2.Rodrigues(rvec)[0] for rvec in rvecs]
+    t_target2cam_list = [tvec.reshape(3, 1) for tvec in tvecs]
+    
+    R_gripper2base_list = [Quaternion(**pose['orientation']).rotation_matrix for pose in poses] # type: ignore
+    t_gripper2base_list = [
+        np.array([
+            pose['position']['x'],
+            pose['position']['y'],
+            pose['position']['z']
+        ]).reshape(3, 1)
+        for pose in poses
+    ]
+    
     R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-        R_gripper2base_list, t_gripper2base_list,
-        R_target2cam, t_target2cam,
+        R_gripper2base_list, t_gripper2base_list, # type: ignore
+        R_target2cam_list, t_target2cam_list,
         method=cv2.CALIB_HAND_EYE_TSAI
     )
+    
+    with open('transformations.pkl', 'wb') as f:
+        pickle.dump({
+            'R_gripper2base': R_gripper2base_list,
+            't_gripper2base': t_gripper2base_list,
+            'R_target2cam': R_target2cam_list,
+            't_target2cam': t_target2cam_list,
+            'R_cam2gripper': R_cam2gripper,
+            't_cam2gripper': t_cam2gripper
+        }, f, protocol=pickle.HIGHEST_PROTOCOL)
 
+    print("Saved transformations to transformations.pkl")
+    
     print("R_cam2gripper:\n", R_cam2gripper)
     print("t_cam2gripper:\n", t_cam2gripper.ravel())
 
-    # 保存标定结果
     np.savez('calib_hand_eye.npz',
                 camera_matrix=camera_matrix,
                 dist_coefs=dist_coefs,
@@ -219,6 +306,7 @@ def main():
     print("标定结果已保存到 calib_hand_eye.npz")
 
     aubo.shutdown()
+    
 
 if __name__ == '__main__':
     main()
